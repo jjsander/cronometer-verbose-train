@@ -1,0 +1,12 @@
+{
+  "name": "cronometer-mcp",
+  "version": "1.0.0",
+  "description": "Cronometer MCP server for Claude.ai — Netlify Functions",
+  "type": "module",
+  "scripts": {
+    "dev": "netlify dev"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
