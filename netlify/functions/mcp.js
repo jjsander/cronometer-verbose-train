@@ -208,6 +208,66 @@ async function getSession() {
   return { userId, token };
 }
 
+// ── Enriched food log — resolves food names from IDs ─────────────────────────
+
+async function getFoodLogEnriched(userId, token, date) {
+  const raw = await crono.getFoodLog(userId, token, date);
+
+  // Pull only food serving entries (skip biometrics and exercise)
+  const servings = (raw?.diary?.diary || []).filter(e => e.type === 'Serving');
+
+  // Batch-fetch food details for all unique foodIds in parallel
+  const uniqueFoodIds = [...new Set(servings.map(e => e.foodId))];
+  const foodDetails = await Promise.all(
+    uniqueFoodIds.map(id =>
+      crono.getFoodDetails(userId, token, id).catch(() => ({ foodId: id, name: `Unknown (${id})` }))
+    )
+  );
+
+  // Build a lookup map: foodId → { name, measures }
+  const foodMap = {};
+  foodDetails.forEach(f => {
+    const id = f.foodId || f.id;
+    foodMap[id] = {
+      name: f.name || f.foodName || `Unknown (${id})`,
+      measures: f.measures || [],
+    };
+  });
+
+  // Enrich each serving with name and serving description
+  const enrichedServings = servings.map(entry => {
+    const food = foodMap[entry.foodId] || {};
+    const measure = (food.measures || []).find(m => m.id === entry.measureId || m.measureId === entry.measureId);
+    return {
+      servingId:   entry.servingId,
+      foodId:      entry.foodId,
+      name:        food.name || `Unknown (${entry.foodId})`,
+      grams:       entry.grams,
+      servingDesc: measure ? `${measure.name || measure.servingName} (${entry.grams}g)` : `${entry.grams}g`,
+      meal:        mealFromOrder(entry.order),
+    };
+  });
+
+  // Return enriched log alongside the original summary data
+  return {
+    date,
+    energy_summary:    raw.energy_summary,
+    nutrition_summary: raw.nutrition_summary,
+    foods: enrichedServings,
+    exercise: (raw?.diary?.diary || [])
+      .filter(e => e.type === 'Exercise')
+      .map(e => ({ name: e.name, minutes: e.minutes, calories: Math.abs(e.calories || 0) })),
+  };
+}
+
+// Cronometer encodes meal slot in the high bits of the order field
+function mealFromOrder(order) {
+  if (!order) return 'Uncategorized';
+  const slot = order >> 16;
+  const meals = { 0: 'Breakfast', 1: 'Lunch', 2: 'Dinner', 3: 'Snacks', 4: 'Uncategorized' };
+  return meals[slot] ?? 'Uncategorized';
+}
+
 // ── Tool dispatch ─────────────────────────────────────────────────────────────
 
 async function callTool(name, args) {
@@ -215,7 +275,7 @@ async function callTool(name, args) {
 
   switch (name) {
     case 'get_food_log':
-      return crono.getFoodLog(userId, token, args.date || today());
+      return getFoodLogEnriched(userId, token, args.date || today());
 
     case 'add_food_entry':
       return crono.addFoodEntry(userId, token, {
