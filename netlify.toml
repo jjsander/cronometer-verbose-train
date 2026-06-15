@@ -22,6 +22,11 @@
   status = 200
 
 [[redirects]]
+  from   = "/authorize"
+  to     = "/.netlify/functions/oauth"
+  status = 200
+
+[[redirects]]
   from   = "/oauth/token"
   to     = "/.netlify/functions/oauth"
   status = 200
