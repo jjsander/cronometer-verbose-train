@@ -275,7 +275,7 @@ async function callTool(name, args) {
 
   switch (name) {
     case 'get_food_log':
-      return getFoodLogEnriched(userId, token, args.date || today());
+      return crono.getFoodLog(userId, token, args.date || today());
 
     case 'add_food_entry':
       return crono.addFoodEntry(userId, token, {
