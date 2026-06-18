@@ -47,6 +47,7 @@ export async function login(username, password) {
   const data = await cronoFetch('/api/v2/login', { username, password });
   console.log('[cronometer-mcp] Login response keys:', JSON.stringify(Object.keys(data)));
   console.log('[cronometer-mcp] Login response:', JSON.stringify(data));
+  console.log('[cronometer-mcp] Attempting login with username:', username);
   return { userId: data.userId, token: data.token };
 }
 
