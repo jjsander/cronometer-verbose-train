@@ -272,8 +272,9 @@ function parseCsvToObjects(csv) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export async function getFoodLog(userId, token, date) {
-  const { cookies, permutation, gwtHeader } = await getSession();
-  const csv = await exportCsv(userId, token, cookies, permutation, gwtHeader, 'servings', date);
+  const session = await getSession();
+  const { cookies, permutation, gwtHeader } = session;
+  const csv = await exportCsv(session.userId, session.token, cookies, permutation, gwtHeader, 'servings', date);
   const rows = parseCsvToObjects(csv);
   return {
     date,
@@ -289,7 +290,18 @@ export async function getFoodLog(userId, token, date) {
   };
 }
 
-export async function addFoodEntry(userId, token, { foodId, measureId, quantity, mealName, timestamp, date }) {
+// Known serving weights (grams) for repeat items — used when servingGrams not provided
+const KNOWN_SERVING_GRAMS = {
+  20185516: 32,    // ON Whey Chocolate
+  61621321: 31,    // ON Whey Vanilla Ice Cream
+  59240658: 32,    // Chike Coffee Protein Mocha
+  2392468:  5,     // Creatine monohydrate
+  37711659: 240,   // Member's Mark Unsweetened Vanilla Almond Milk
+  463083:   100,   // NCCDB chicken breast cooked (per 100g)
+  66243469: 60,    // Quest Cookies & Cream bar
+};
+
+export async function addFoodEntry(userId, token, { foodId, measureId, quantity, mealName, timestamp, date, servingGrams }) {
   const session = await getSession();
   const { cookies, permutation, gwtHeader } = session;
 
@@ -301,17 +313,19 @@ export async function addFoodEntry(userId, token, { foodId, measureId, quantity,
   const mealGroups = { breakfast: 1, lunch: 2, dinner: 3, snacks: 4 };
   const diaryGroup = mealGroups[(mealName || 'snacks').toLowerCase()] || 4;
 
-  // Use universal measure ID with quantity as weight in grams
-  const effectiveMeasureId = measureId || UNIVERSAL_MEASURE_ID;
   // Encode diary group into high 16 bits of measure ID (as per Python client)
+  const effectiveMeasureId = measureId || UNIVERSAL_MEASURE_ID;
   const encodedMeasureId = (diaryGroup << 16) | (effectiveMeasureId & 0xFFFF);
-  const weightGrams = Math.round(quantity * 100) / 100;
+
+  // weightGrams = quantity × grams per serving
+  const gramsPerServing = servingGrams || KNOWN_SERVING_GRAMS[String(foodId)] || KNOWN_SERVING_GRAMS[Number(foodId)] || 100;
+  const weightGrams = Math.round(quantity * gramsPerServing * 100) / 100;
 
   const body = GWT_UPDATE_DIARY(
     gwtHeader, session.token, session.userId,
     day, month, year,
     quantity, diaryGroup, encodedMeasureId,
-    weightGrams, foodId, foodId  // foodSourceId = foodId as fallback
+    weightGrams, foodId, foodId
   );
 
   const raw = await gwtPost(body, cookies, permutation);
@@ -350,7 +364,7 @@ export async function getFoodDetails(userId, token, foodId) {
 export async function getNutritionSummary(userId, token, date) {
   const session = await getSession();
   const { cookies, permutation, gwtHeader } = session;
-  const csv = await exportCsv(userId, token, cookies, permutation, gwtHeader, 'dailySummary', date);
+  const csv = await exportCsv(session.userId, session.token, cookies, permutation, gwtHeader, 'dailySummary', date);
   const rows = parseCsvToObjects(csv);
   return { date, summary: rows[0] || {} };
 }
