@@ -1,26 +1,46 @@
 /**
- * Cronometer GWT-RPC API client (JavaScript port of cphoskins/cronometer-mcp)
+ * Cronometer API client
  *
- * Auth flow:
- *   1. GET /login/ → scrape anticsrf token
- *   2. POST /login  with credentials + anticsrf → session cookie (sesnonce)
- *   3. POST /cronometer/app GWT authenticate → userId + updated nonce
- *   4. All subsequent GWT calls use session cookie + nonce
+ * Two protocols are in play, confirmed via live HAR captures (June 2026):
  *
- * GWT values auto-discovered from live app on login.
- * Fallback defaults included if discovery fails.
+ *   1. GWT-RPC (POST https://cronometer.com/cronometer/app) — used for
+ *      diary writes (updateDiary), removeServing, copyDay, setDayComplete,
+ *      getAllMacroSchedules, getUserFasts, getFastingStats, getFood,
+ *      generateAuthorizationToken (used for CSV export reads). This is the
+ *      original reverse-engineered protocol (ported from
+ *      cphoskins/cronometer-mcp).
  *
- * IMPORTANT — permutation hash staleness:
- *   Cronometer rotates its GWT permutation hash on every web deploy. The
- *   cached CRONOMETER_GWT_PERMUTATION / CRONOMETER_GWT_HEADER env vars (or
- *   the hardcoded DEFAULT_* fallbacks) can go stale independently of the
- *   cached session token/userId — a perfectly valid session will still
- *   throw IncompatibleRemoteServiceException on every RPC whose method
- *   signature changed in the new build. All GWT-RPC calls below now route
- *   through gwtPostWithRefresh(), which catches that specific exception,
- *   re-discovers the live hash via discoverGwtHashes(), retries once, and
- *   logs the fresh values so they can be copied into Netlify env vars to
- *   avoid re-discovering on every cold start.
+ *   2. Plain REST (GET https://cronometer.com/api/v3/...) — used for food
+ *      search. Cronometer migrated search off GWT-RPC at some point; the
+ *      old findFoods GWT method no longer exists server-side, which is why
+ *      it threw IncompatibleRemoteServiceException no matter what GWT
+ *      permutation/header was supplied. Confirmed via HAR capture of the
+ *      live web app searching "sirloin":
+ *        GET /api/v3/user/{userId}/food-search/string
+ *            ?query=SIRLOIN&maxResults=50&sources=All&categoryId=0
+ *            &selectedTab=ALL&type=All
+ *      Response is plain JSON: [{ id, name, source, measureId,
+ *      measureDisplayName, category, ... }, ...]
+ *      Auth for this endpoint rides on the same session cookie as GWT calls
+ *      — no separate auth step needed.
+ *
+ * IMPORTANT — two different "header" values, easy to confuse:
+ *   - X-GWT-Permutation (HTTP header): the live $strongName from the
+ *     compiled GWT JS, e.g. discovered via cronometer.nocache.js. This
+ *     rotates whenever Cronometer ships a new web build.
+ *   - The in-body method-signature header (the 5th pipe-delimited field in
+ *     every GWT-RPC request body, e.g. updateDiary's request): confirmed
+ *     via HAR to still be the original hardcoded constant
+ *     F25561B47C31168F0ED80B768B647985 as of June 2026, *regardless* of the
+ *     current permutation. These are NOT the same value and do NOT update
+ *     together — a previous fix attempt incorrectly set
+ *     CRONOMETER_GWT_HEADER to the discovered permutation value, which
+ *     looked plausible (same format) but was wrong, and broke
+ *     previously-working calls like addFoodEntry/updateDiary.
+ *   Bottom line: leave CRONOMETER_GWT_HEADER unset or equal to
+ *   DEFAULT_GWT_HEADER unless you have specific evidence (e.g. a fresh HAR
+ *   capture) that it has changed. CRONOMETER_GWT_PERMUTATION is the one
+ *   that legitimately needs updating after Cronometer deploys.
  */
 
 const BASE = 'https://cronometer.com';
@@ -29,20 +49,20 @@ const GWT_MODULE_BASE = `${BASE}/cronometer/`;
 const GWT_NOCACHE_JS_URL = `${BASE}/cronometer/cronometer.nocache.js`;
 const GWT_CACHE_JS_URL = `${BASE}/cronometer/{permutation}.cache.js`;
 
-// Fallback GWT values — update if auth breaks after a Cronometer deploy
-const DEFAULT_GWT_PERMUTATION = 'F25561B47C31168F0ED80B768B647985';
-const DEFAULT_GWT_HEADER      = 'F25561B47C31168F0ED80B768B647985';
+// Fallback GWT values. DEFAULT_GWT_HEADER is the in-body method-signature
+// header and has been confirmed stable via HAR capture (June 2026) — do not
+// change this based on a permutation discovery; see file header comment.
+const DEFAULT_GWT_PERMUTATION = '0AC0B7E4D7F952D1D90194EA6F2AC472'; // confirmed live via HAR, June 2026
+const DEFAULT_GWT_HEADER      = 'F25561B47C31168F0ED80B768B647985'; // confirmed live via HAR, June 2026 — distinct from permutation
 const GWT_CONTENT_TYPE        = 'text/x-gwt-rpc; charset=UTF-8';
 
-// GWT RPC templates (ported from Python client)
+// GWT RPC templates (ported from Python client; updateDiary/getFood/etc.
+// signatures confirmed unchanged via live HAR capture, June 2026)
 const GWT_AUTHENTICATE = (h) =>
   `7|0|5|${GWT_MODULE_BASE}|${h}|com.cronometer.shared.rpc.CronometerService|authenticate|java.lang.Integer/3438268394|1|2|3|4|1|5|5|-300|`;
 
 const GWT_GENERATE_AUTH_TOKEN = (h, nonce, userId) =>
   `7|0|8|${GWT_MODULE_BASE}|${h}|com.cronometer.shared.rpc.CronometerService|generateAuthorizationToken|java.lang.String/2004016611|I|com.cronometer.shared.user.AuthScope/2065601159|${nonce}|1|2|3|4|4|5|6|6|7|8|${userId}|3600|7|2|`;
-
-const GWT_FIND_FOODS = (h, nonce, query, maxResults) =>
-  `7|0|12|${GWT_MODULE_BASE}|${h}|com.cronometer.shared.rpc.CronometerService|findFoods|java.lang.String/2004016611|I|[Lcom.cronometer.shared.foods.FoodSource;/3597302983|com.cronometer.shared.foods.FoodSearchTabSelection/1776179901|Z|${nonce}|${query}|com.cronometer.shared.foods.FoodSource/4236433762|1|2|3|4|8|5|5|6|7|6|5|8|9|10|11|${maxResults}|7|1|12|0|0|0|8|0|0|`;
 
 const GWT_UPDATE_DIARY = (h, nonce, userId, day, month, year, quantity, diaryGroup, measureId, weightGrams, foodSourceId, foodId) =>
   `7|0|12|${GWT_MODULE_BASE}|${h}|com.cronometer.shared.rpc.CronometerService|updateDiary|java.lang.String/2004016611|I|java.util.List|${nonce}|java.util.Collections$SingletonList/1586180994|com.cronometer.shared.entries.changes.AddEntryChange/3949104564|com.cronometer.shared.entries.models.Serving/2553599101|com.cronometer.shared.entries.models.Day/782579793|1|2|3|4|3|5|6|7|8|${userId}|9|10|1|1|11|12|${day}|${month}|${year}|${quantity}|${diaryGroup}|0|${measureId}|0|0|${weightGrams}|${foodSourceId}|A|${foodId}|0|1|`;
@@ -95,7 +115,7 @@ function getSetCookies(res) {
   return val ? [val] : [];
 }
 
-// ── GWT hash discovery ────────────────────────────────────────────────────────
+// ── GWT hash discovery (last-resort fallback only — see file header) ─────────
 
 async function discoverGwtHashes(cookies) {
   try {
@@ -112,6 +132,13 @@ async function discoverGwtHashes(cookies) {
       headers: { 'Cookie': cookieHeader(cookies), 'User-Agent': 'cronometer-mcp/1.0' },
     });
     const cacheJs = await cacheRes.text();
+    // NOTE: this regex looking for 'app','HASH' does not match the real
+    // cache.js format observed in HAR/source captures and will essentially
+    // never find anything — it's a leftover from the original Python port.
+    // It falls through to using the permutation as the header, which is
+    // usually wrong (see file header comment). Kept only as an absolute
+    // last resort after both the live session header and DEFAULT_GWT_HEADER
+    // have failed.
     const headerMatch = cacheJs.match(/'app','([A-F0-9]{32})'/);
     const gwtHeader = headerMatch ? headerMatch[1] : permutation;
 
@@ -146,12 +173,10 @@ async function gwtPost(body, cookies, permutation) {
 }
 
 /**
- * Run a GWT call, and if it fails with IncompatibleRemoteServiceException
- * (Cronometer rotated its permutation hash on a new web deploy), rediscover
- * the live hash and retry exactly once. Mutates `session` in place so the
- * caller's subsequent calls in the same invocation reuse the fresh hash.
- *
- * bodyFn: (gwtHeader) => requestBodyString
+ * Run a GWT call. On IncompatibleRemoteServiceException, retry once with
+ * DEFAULT_GWT_HEADER (the confirmed-correct in-body signature header) before
+ * falling back to full rediscovery, which is unreliable (see
+ * discoverGwtHashes comment) and should rarely actually be needed.
  */
 async function gwtPostWithRefresh(bodyFn, session) {
   const { cookies } = session;
@@ -159,6 +184,18 @@ async function gwtPostWithRefresh(bodyFn, session) {
     return await gwtPost(bodyFn(session.gwtHeader), cookies, session.permutation);
   } catch (err) {
     if (!/IncompatibleRemoteServiceException/.test(err.message)) throw err;
+
+    if (session.gwtHeader !== DEFAULT_GWT_HEADER) {
+      console.log('[cronometer-mcp] Retrying with DEFAULT_GWT_HEADER...');
+      try {
+        const result = await gwtPost(bodyFn(DEFAULT_GWT_HEADER), cookies, session.permutation);
+        session.gwtHeader = DEFAULT_GWT_HEADER;
+        return result;
+      } catch (err2) {
+        if (!/IncompatibleRemoteServiceException/.test(err2.message)) throw err2;
+      }
+    }
+
     console.log('[cronometer-mcp] Stale GWT permutation detected, rediscovering...');
     const fresh = await discoverGwtHashes(cookies);
     console.log('[cronometer-mcp] Refreshed GWT — set these env vars to persist and skip rediscovery:');
@@ -202,14 +239,15 @@ export async function login(username, password) {
   const sessionCookies = { ...initCookies, ...parseCookies(loginSetCookies) };
 
   if (!sessionCookies.sesnonce) {
-    // Try following redirect
     const loginResText = await loginRes.text().catch(() => '');
     console.log('[cronometer-mcp] Login response status:', loginRes.status, loginResText.slice(0, 200));
     throw new Error('Login failed: no sesnonce cookie received. Check credentials.');
   }
 
-  // Step 3: Discover GWT hashes
-  const { permutation, gwtHeader } = await discoverGwtHashes(sessionCookies);
+  // Step 3: Discover GWT permutation (header stays DEFAULT_GWT_HEADER — see
+  // file header comment; do not derive it from discovery)
+  const { permutation } = await discoverGwtHashes(sessionCookies);
+  const gwtHeader = DEFAULT_GWT_HEADER;
 
   // Step 4: GWT authenticate → userId
   const authBody = GWT_AUTHENTICATE(gwtHeader);
@@ -230,7 +268,6 @@ export async function login(username, password) {
   if (!userIdMatch) throw new Error(`GWT authenticate failed: ${authText.slice(0, 200)}`);
   const userId = userIdMatch[1];
 
-  // Update nonce from authenticate response cookies
   const authCookies = parseCookies(getSetCookies(authRes));
   const finalCookies = { ...sessionCookies, ...authCookies };
   const nonce = finalCookies.sesnonce || sessionCookies.sesnonce;
@@ -251,7 +288,16 @@ export async function getSession() {
   const userId      = process.env.CRONOMETER_USER_ID;
   const token       = process.env.CRONOMETER_SESSION_TOKEN;
   const permutation = process.env.CRONOMETER_GWT_PERMUTATION || DEFAULT_GWT_PERMUTATION;
-  const gwtHeader   = process.env.CRONOMETER_GWT_HEADER || DEFAULT_GWT_HEADER;
+  // Deliberately ignore a possibly-stale CRONOMETER_GWT_HEADER env var if it
+  // doesn't match the confirmed-correct default — protects against the
+  // exact bad-env-var state that broke addFoodEntry previously. If you have
+  // fresh HAR evidence the header genuinely changed, update DEFAULT_GWT_HEADER
+  // in this file directly rather than relying on the env var.
+  const envHeader = process.env.CRONOMETER_GWT_HEADER;
+  const gwtHeader = envHeader || DEFAULT_GWT_HEADER;
+  if (envHeader && envHeader !== DEFAULT_GWT_HEADER) {
+    console.log(`[cronometer-mcp] WARNING: CRONOMETER_GWT_HEADER env var (${envHeader}) differs from confirmed default (${DEFAULT_GWT_HEADER}). Using env value, but this may be the cause of GWT call failures.`);
+  }
 
   if (userId && token) {
     return {
@@ -273,7 +319,6 @@ export async function getSession() {
 // ── Export helper (for food log and nutrition summary reads) ──────────────────
 
 async function exportCsv(userId, token, cookies, permutation, gwtHeader, exportType, date) {
-  // Generate an auth token for export
   const genText = await gwtPostWithRefresh(
     (h) => GWT_GENERATE_AUTH_TOKEN(h, token, userId),
     { cookies, permutation, gwtHeader }
@@ -343,19 +388,15 @@ const KNOWN_SERVING_GRAMS = {
 export async function addFoodEntry(userId, token, { foodId, measureId, quantity, mealName, timestamp, date, servingGrams }) {
   const session = await getSession();
 
-  // Parse date
   const d = new Date(date || new Date().toISOString().slice(0, 10));
   const day = d.getUTCDate(), month = d.getUTCMonth() + 1, year = d.getUTCFullYear();
 
-  // Map mealName to diary group int
   const mealGroups = { breakfast: 1, lunch: 2, dinner: 3, snacks: 4 };
   const diaryGroup = mealGroups[(mealName || 'snacks').toLowerCase()] || 4;
 
-  // Encode diary group into high 16 bits of measure ID (as per Python client)
   const effectiveMeasureId = measureId || UNIVERSAL_MEASURE_ID;
   const encodedMeasureId = (diaryGroup << 16) | (effectiveMeasureId & 0xFFFF);
 
-  // weightGrams = quantity × grams per serving
   const gramsPerServing = servingGrams || KNOWN_SERVING_GRAMS[String(foodId)] || KNOWN_SERVING_GRAMS[Number(foodId)] || 100;
   const weightGrams = Math.round(quantity * gramsPerServing * 100) / 100;
 
@@ -385,13 +426,51 @@ export async function removeFoodEntry(userId, token, servingId) {
   return { success: true };
 }
 
+/**
+ * Food search — rewritten against the real REST endpoint (confirmed via
+ * HAR capture, June 2026). The old GWT findFoods RPC no longer exists
+ * server-side; this is not a permutation/header issue and cannot be fixed
+ * by GWT hash rediscovery.
+ *
+ * GET /api/v3/user/{userId}/food-search/string
+ *     ?query=...&maxResults=...&sources=All&categoryId=0&selectedTab=ALL&type=All
+ *
+ * Response: JSON array of objects like:
+ *   { id, name, source, measureId, measureDisplayName, category,
+ *     globalPopularity, userPopularity, type, recipeOrMeal, ... }
+ */
 export async function searchFoods(userId, token, query, limit = 20) {
   const session = await getSession();
-  const raw = await gwtPostWithRefresh(
-    (h) => GWT_FIND_FOODS(h, session.token, query.toUpperCase(), limit),
-    session
-  );
-  return { raw: raw.slice(0, 500), note: 'GWT findFoods response — parse with _parse_find_foods logic if needed' };
+  const { cookies } = session;
+
+  const url = `${BASE}/api/v3/user/${session.userId}/food-search/string` +
+    `?query=${encodeURIComponent(query)}` +
+    `&maxResults=${limit}` +
+    `&sources=All&categoryId=0&selectedTab=ALL&type=All`;
+
+  const res = await fetch(url, {
+    headers: {
+      'Cookie': cookieHeader(cookies),
+      'User-Agent': 'cronometer-mcp/1.0',
+      'Referer': `${BASE}/`,
+      'Accept': '*/*',
+      'X-Crono-Use-Open-Search': 'true',
+    },
+  });
+  if (!res.ok) throw new Error(`Food search request failed: ${res.status}`);
+  const results = await res.json();
+
+  return {
+    results: results.map(r => ({
+      foodId: r.id,
+      name: r.name,
+      source: r.source,
+      measureId: r.measureId,
+      measureDisplayName: r.measureDisplayName,
+      type: r.type,
+      isRecipeOrMeal: !!r.recipeOrMeal,
+    })),
+  };
 }
 
 export async function getFoodDetails(userId, token, foodId) {
@@ -471,13 +550,10 @@ export async function getFastingStats(userId, token) {
 }
 
 // ── add_custom_food — NOT YET IMPLEMENTED ──────────────────────────────────
-// This is a stub, not an auth bug. Implementing it for real requires the
-// exact GWT method signature (class/field hashes) for whatever Cronometer
-// RPC creates a custom food — e.g. something like
-// CronometerService.createCustomFood(...) — which hasn't been reverse
-// engineered here. Fabricating a plausible-looking GWT request body without
-// the real signature risks the server silently accepting malformed data
-// rather than failing loudly, so it's left unimplemented rather than guessed.
+// Still a stub, not an auth bug. No GWT or REST signature for food creation
+// has been captured/confirmed yet. If you can capture a HAR of creating a
+// custom food in the Cronometer web app, paste it and this can be
+// implemented the same way searchFoods was fixed.
 export async function addCustomFood(userId, token, { name, servingName, servingGrams, nutrition }) {
-  throw new Error('addCustomFood not yet implemented in GWT client. Use the Cronometer app to create custom foods for now.');
+  throw new Error('addCustomFood not yet implemented in client. Use the Cronometer app to create custom foods for now.');
 }
