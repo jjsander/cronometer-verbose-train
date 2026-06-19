@@ -9,6 +9,18 @@
  *
  * GWT values auto-discovered from live app on login.
  * Fallback defaults included if discovery fails.
+ *
+ * IMPORTANT — permutation hash staleness:
+ *   Cronometer rotates its GWT permutation hash on every web deploy. The
+ *   cached CRONOMETER_GWT_PERMUTATION / CRONOMETER_GWT_HEADER env vars (or
+ *   the hardcoded DEFAULT_* fallbacks) can go stale independently of the
+ *   cached session token/userId — a perfectly valid session will still
+ *   throw IncompatibleRemoteServiceException on every RPC whose method
+ *   signature changed in the new build. All GWT-RPC calls below now route
+ *   through gwtPostWithRefresh(), which catches that specific exception,
+ *   re-discovers the live hash via discoverGwtHashes(), retries once, and
+ *   logs the fresh values so they can be copied into Netlify env vars to
+ *   avoid re-discovering on every cold start.
  */
 
 const BASE = 'https://cronometer.com';
@@ -133,6 +145,31 @@ async function gwtPost(body, cookies, permutation) {
   return text;
 }
 
+/**
+ * Run a GWT call, and if it fails with IncompatibleRemoteServiceException
+ * (Cronometer rotated its permutation hash on a new web deploy), rediscover
+ * the live hash and retry exactly once. Mutates `session` in place so the
+ * caller's subsequent calls in the same invocation reuse the fresh hash.
+ *
+ * bodyFn: (gwtHeader) => requestBodyString
+ */
+async function gwtPostWithRefresh(bodyFn, session) {
+  const { cookies } = session;
+  try {
+    return await gwtPost(bodyFn(session.gwtHeader), cookies, session.permutation);
+  } catch (err) {
+    if (!/IncompatibleRemoteServiceException/.test(err.message)) throw err;
+    console.log('[cronometer-mcp] Stale GWT permutation detected, rediscovering...');
+    const fresh = await discoverGwtHashes(cookies);
+    console.log('[cronometer-mcp] Refreshed GWT — set these env vars to persist and skip rediscovery:');
+    console.log(`  CRONOMETER_GWT_PERMUTATION=${fresh.permutation}`);
+    console.log(`  CRONOMETER_GWT_HEADER=${fresh.gwtHeader}`);
+    session.permutation = fresh.permutation;
+    session.gwtHeader = fresh.gwtHeader;
+    return gwtPost(bodyFn(fresh.gwtHeader), cookies, fresh.permutation);
+  }
+}
+
 // ── Login ─────────────────────────────────────────────────────────────────────
 
 export async function login(username, password) {
@@ -211,10 +248,10 @@ export async function login(username, password) {
 // ── Session management ────────────────────────────────────────────────────────
 
 export async function getSession() {
-  const userId     = process.env.CRONOMETER_USER_ID;
-  const token      = process.env.CRONOMETER_SESSION_TOKEN;
+  const userId      = process.env.CRONOMETER_USER_ID;
+  const token       = process.env.CRONOMETER_SESSION_TOKEN;
   const permutation = process.env.CRONOMETER_GWT_PERMUTATION || DEFAULT_GWT_PERMUTATION;
-  const gwtHeader  = process.env.CRONOMETER_GWT_HEADER || DEFAULT_GWT_HEADER;
+  const gwtHeader   = process.env.CRONOMETER_GWT_HEADER || DEFAULT_GWT_HEADER;
 
   if (userId && token) {
     return {
@@ -237,8 +274,10 @@ export async function getSession() {
 
 async function exportCsv(userId, token, cookies, permutation, gwtHeader, exportType, date) {
   // Generate an auth token for export
-  const genBody = GWT_GENERATE_AUTH_TOKEN(gwtHeader, token, userId);
-  const genText = await gwtPost(genBody, cookies, permutation);
+  const genText = await gwtPostWithRefresh(
+    (h) => GWT_GENERATE_AUTH_TOKEN(h, token, userId),
+    { cookies, permutation, gwtHeader }
+  );
   const tokenMatch = genText.match(/"([^"]+)"/);
   if (!tokenMatch) throw new Error(`Could not extract export token: ${genText.slice(0, 200)}`);
   const exportToken = tokenMatch[1];
@@ -303,7 +342,6 @@ const KNOWN_SERVING_GRAMS = {
 
 export async function addFoodEntry(userId, token, { foodId, measureId, quantity, mealName, timestamp, date, servingGrams }) {
   const session = await getSession();
-  const { cookies, permutation, gwtHeader } = session;
 
   // Parse date
   const d = new Date(date || new Date().toISOString().slice(0, 10));
@@ -321,14 +359,15 @@ export async function addFoodEntry(userId, token, { foodId, measureId, quantity,
   const gramsPerServing = servingGrams || KNOWN_SERVING_GRAMS[String(foodId)] || KNOWN_SERVING_GRAMS[Number(foodId)] || 100;
   const weightGrams = Math.round(quantity * gramsPerServing * 100) / 100;
 
-  const body = GWT_UPDATE_DIARY(
-    gwtHeader, session.token, session.userId,
-    day, month, year,
-    quantity, diaryGroup, encodedMeasureId,
-    weightGrams, foodId, foodId
+  const raw = await gwtPostWithRefresh(
+    (h) => GWT_UPDATE_DIARY(
+      h, session.token, session.userId,
+      day, month, year,
+      quantity, diaryGroup, encodedMeasureId,
+      weightGrams, foodId, foodId
+    ),
+    session
   );
-
-  const raw = await gwtPost(body, cookies, permutation);
   const servingMatch = raw.match(/\/\/OK\[\d+,\d+,\d+,"([^"]+)"/);
   return {
     success: true,
@@ -339,25 +378,28 @@ export async function addFoodEntry(userId, token, { foodId, measureId, quantity,
 
 export async function removeFoodEntry(userId, token, servingId) {
   const session = await getSession();
-  const { cookies, permutation, gwtHeader } = session;
-  const body = GWT_REMOVE_SERVING(gwtHeader, session.token, session.userId, servingId);
-  await gwtPost(body, cookies, permutation);
+  await gwtPostWithRefresh(
+    (h) => GWT_REMOVE_SERVING(h, session.token, session.userId, servingId),
+    session
+  );
   return { success: true };
 }
 
 export async function searchFoods(userId, token, query, limit = 20) {
   const session = await getSession();
-  const { cookies, permutation, gwtHeader } = session;
-  const body = GWT_FIND_FOODS(gwtHeader, session.token, query.toUpperCase(), limit);
-  const raw = await gwtPost(body, cookies, permutation);
+  const raw = await gwtPostWithRefresh(
+    (h) => GWT_FIND_FOODS(h, session.token, query.toUpperCase(), limit),
+    session
+  );
   return { raw: raw.slice(0, 500), note: 'GWT findFoods response — parse with _parse_find_foods logic if needed' };
 }
 
 export async function getFoodDetails(userId, token, foodId) {
   const session = await getSession();
-  const { cookies, permutation, gwtHeader } = session;
-  const body = GWT_GET_FOOD(gwtHeader, session.token, foodId);
-  const raw = await gwtPost(body, cookies, permutation);
+  const raw = await gwtPostWithRefresh(
+    (h) => GWT_GET_FOOD(h, session.token, foodId),
+    session
+  );
   return { foodId, raw: raw.slice(0, 500) };
 }
 
@@ -375,54 +417,67 @@ export async function getNutritionScores(userId, token, date) {
 
 export async function copyDay(userId, token, fromDate, toDate) {
   const session = await getSession();
-  const { cookies, permutation, gwtHeader } = session;
   const src = new Date(fromDate), dst = new Date(toDate);
-  const body = GWT_COPY_DAY(
-    gwtHeader, session.token, session.userId,
-    src.getUTCDate(), src.getUTCMonth() + 1, src.getUTCFullYear(),
-    dst.getUTCDate(), dst.getUTCMonth() + 1, dst.getUTCFullYear(),
+  await gwtPostWithRefresh(
+    (h) => GWT_COPY_DAY(
+      h, session.token, session.userId,
+      src.getUTCDate(), src.getUTCMonth() + 1, src.getUTCFullYear(),
+      dst.getUTCDate(), dst.getUTCMonth() + 1, dst.getUTCFullYear(),
+    ),
+    session
   );
-  await gwtPost(body, cookies, permutation);
   return { success: true };
 }
 
 export async function markDayComplete(userId, token, date, complete = true) {
   const session = await getSession();
-  const { cookies, permutation, gwtHeader } = session;
   const d = new Date(date);
-  const body = GWT_SET_DAY_COMPLETE(
-    gwtHeader, session.token, session.userId,
-    d.getUTCDate(), d.getUTCMonth() + 1, d.getUTCFullYear(),
-    complete ? 1 : 0,
+  await gwtPostWithRefresh(
+    (h) => GWT_SET_DAY_COMPLETE(
+      h, session.token, session.userId,
+      d.getUTCDate(), d.getUTCMonth() + 1, d.getUTCFullYear(),
+      complete ? 1 : 0,
+    ),
+    session
   );
-  await gwtPost(body, cookies, permutation);
   return { success: true };
 }
 
 export async function getMacroTargets(userId, token) {
   const session = await getSession();
-  const { cookies, permutation, gwtHeader } = session;
-  const body = GWT_GET_MACRO_TARGETS(gwtHeader, session.token, session.userId);
-  const raw = await gwtPost(body, cookies, permutation);
+  const raw = await gwtPostWithRefresh(
+    (h) => GWT_GET_MACRO_TARGETS(h, session.token, session.userId),
+    session
+  );
   return { raw: raw.slice(0, 500) };
 }
 
 export async function getFastingHistory(userId, token, startDate, endDate) {
   const session = await getSession();
-  const { cookies, permutation, gwtHeader } = session;
-  const body = GWT_GET_USER_FASTS(gwtHeader, session.token, session.userId);
-  const raw = await gwtPost(body, cookies, permutation);
+  const raw = await gwtPostWithRefresh(
+    (h) => GWT_GET_USER_FASTS(h, session.token, session.userId),
+    session
+  );
   return { raw: raw.slice(0, 500) };
 }
 
 export async function getFastingStats(userId, token) {
   const session = await getSession();
-  const { cookies, permutation, gwtHeader } = session;
-  const body = GWT_GET_FASTING_STATS(gwtHeader, session.token, session.userId);
-  const raw = await gwtPost(body, cookies, permutation);
+  const raw = await gwtPostWithRefresh(
+    (h) => GWT_GET_FASTING_STATS(h, session.token, session.userId),
+    session
+  );
   return { raw: raw.slice(0, 500) };
 }
 
+// ── add_custom_food — NOT YET IMPLEMENTED ──────────────────────────────────
+// This is a stub, not an auth bug. Implementing it for real requires the
+// exact GWT method signature (class/field hashes) for whatever Cronometer
+// RPC creates a custom food — e.g. something like
+// CronometerService.createCustomFood(...) — which hasn't been reverse
+// engineered here. Fabricating a plausible-looking GWT request body without
+// the real signature risks the server silently accepting malformed data
+// rather than failing loudly, so it's left unimplemented rather than guessed.
 export async function addCustomFood(userId, token, { name, servingName, servingGrams, nutrition }) {
-  throw new Error('addCustomFood not yet implemented in GWT client. Use Cronometer app to create custom foods.');
+  throw new Error('addCustomFood not yet implemented in GWT client. Use the Cronometer app to create custom foods for now.');
 }
