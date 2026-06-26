@@ -14,6 +14,14 @@
 
 import * as crono from './cronometer.js';
 import { login } from './cronometer.js';
+import {
+  getPermutationHash,
+  addFood as gwtAddFood,
+  editFood as gwtEditFood,
+  parseFoodIdFromResponse,
+  makeNutrientMap,
+  NUTRIENT_ID,
+} from './gwt.js';
 
 // ── MCP Tool Definitions ──────────────────────────────────────────────────────
 
@@ -166,6 +174,83 @@ const TOOLS = [
       properties: {},
     },
   },
+  {
+    name: 'create_recipe',
+    description: `Create a new recipe in Cronometer via the GWT web API.
+Ingredients are specified as an array of food items with their serving amounts.
+Nutrient values are computed automatically from ingredients if not provided — supply 'nutrients' to override.
+Returns the new recipe's foodId on success.`,
+    inputSchema: {
+      type: 'object',
+      required: ['name', 'ingredients', 'servingGrams'],
+      properties: {
+        name:         { type: 'string',  description: 'Recipe name.' },
+        servingGrams: { type: 'number',  description: 'Total grams for the primary serving (e.g. total weight of the recipe batch).' },
+        servingName:  { type: 'string',  description: 'Label for the primary serving, e.g. "full recipe" or "1 serving". Defaults to "full recipe".' },
+        note:         { type: 'string',  description: 'Optional note.' },
+        ingredients: {
+          type: 'array',
+          description: 'List of ingredients.',
+          items: {
+            type: 'object',
+            required: ['foodId', 'measureId', 'grams'],
+            properties: {
+              foodId:    { type: 'number', description: 'Cronometer food ID.' },
+              measureId: { type: 'number', description: 'Measure ID for the serving used.' },
+              grams:     { type: 'number', description: 'Grams of this ingredient in the recipe.' },
+            },
+          },
+        },
+        nutrients: {
+          type: 'object',
+          description: 'Optional nutrient overrides. Keys are nutrient names (energy, protein, fat, carbs, fiber, sugars, sodium, etc.) or numeric Cronometer nutrient IDs. Values are amounts in standard units (g, mg, kcal).',
+        },
+      },
+    },
+  },
+  {
+    name: 'update_recipe',
+    description: `Update an existing recipe in Cronometer via the GWT web API.
+The foodId of the recipe to edit is required. All ingredient and nutrient values are replaced.
+Returns the recipe's foodId on success.`,
+    inputSchema: {
+      type: 'object',
+      required: ['foodId', 'primaryMeasureId', 'name', 'ingredients', 'servingGrams'],
+      properties: {
+        foodId:           { type: 'number', description: 'Existing recipe food ID.' },
+        primaryMeasureId: { type: 'number', description: 'Primary measure ID of the existing recipe (returned by get_food_details or create_recipe).' },
+        name:             { type: 'string', description: 'Recipe name.' },
+        servingGrams:     { type: 'number', description: 'Total grams for the primary serving.' },
+        servingName:      { type: 'string', description: 'Label for the primary serving. Defaults to "full recipe".' },
+        note:             { type: 'string', description: 'Optional note.' },
+        ingredients: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['foodId', 'measureId', 'grams'],
+            properties: {
+              foodId:        { type: 'number', description: 'Cronometer food ID.' },
+              measureId:     { type: 'number', description: 'Measure ID.' },
+              grams:         { type: 'number', description: 'Grams of this ingredient.' },
+              ingredientId:  { type: 'string', description: 'Existing ingredient ID (from prior editFood response). Omit for new ingredients.' },
+            },
+          },
+        },
+        nutrients: {
+          type: 'object',
+          description: 'Optional nutrient overrides (same as create_recipe).',
+        },
+      },
+    },
+  },
+  {
+    name: 'get_gwt_permutation',
+    description: 'Diagnostic: fetch the current GWT permutation hash from cronometer.nocache.js. Useful to verify auto-discovery is working and to compare against a freshly captured HAR.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
 ];
 
 // ── Date helpers ──────────────────────────────────────────────────────────────
@@ -268,6 +353,50 @@ function mealFromOrder(order) {
   return meals[slot] ?? 'Uncategorized';
 }
 
+// ── Nutrient resolution ───────────────────────────────────────────────────────
+
+/**
+ * Build the nutrient map for a recipe GWT call.
+ * If the caller supplied explicit nutrients, use those directly.
+ * Otherwise, fetch each ingredient's nutrition via REST and sum the macros.
+ * Falls back to zeros on any fetch error (logs a warning).
+ */
+async function resolveNutrients(userId, token, ingredients, explicitNutrients) {
+  if (explicitNutrients && Object.keys(explicitNutrients).length > 0) {
+    return makeNutrientMap(explicitNutrients);
+  }
+
+  // Compute from ingredients
+  const totals = {};
+  await Promise.all(ingredients.map(async ing => {
+    try {
+      const detail = await crono.getFoodDetails(userId, token, ing.foodId);
+      // REST API returns nutrition per 100g in a 'nutrients' object keyed by name
+      // Scale by (ing.grams / 100)
+      const scale = ing.grams / 100;
+      const src = detail?.nutrients ?? detail?.nutrition ?? {};
+      for (const [k, v] of Object.entries(src)) {
+        const numKey = isNaN(Number(k)) ? k : Number(k);
+        totals[numKey] = (totals[numKey] ?? 0) + (v ?? 0) * scale;
+      }
+    } catch (err) {
+      console.warn(`[resolveNutrients] Could not fetch details for foodId ${ing.foodId}:`, err.message);
+    }
+  }));
+
+  // Map named nutrient keys to Cronometer GWT IDs
+  const named = {};
+  for (const [k, v] of Object.entries(totals)) {
+    if (NUTRIENT_ID[k] !== undefined) {
+      named[NUTRIENT_ID[k]] = (named[NUTRIENT_ID[k]] ?? 0) + v;
+    } else if (!isNaN(Number(k))) {
+      named[Number(k)] = (named[Number(k)] ?? 0) + v;
+    }
+  }
+
+  return makeNutrientMap(named);
+}
+
 // ── Tool dispatch ─────────────────────────────────────────────────────────────
 
 async function callTool(name, args) {
@@ -328,6 +457,40 @@ async function callTool(name, args) {
 
     case 'get_fasting_stats':
       return crono.getFastingStats(userId, token);
+
+    case 'create_recipe': {
+      const nutrients = await resolveNutrients(userId, token, args.ingredients, args.nutrients);
+      const raw = await gwtAddFood(token, parseInt(userId), {
+        name:         args.name,
+        servingName:  args.servingName || 'full recipe',
+        servingGrams: args.servingGrams,
+        ingredients:  args.ingredients,
+        nutrients,
+        note:         args.note || '',
+        foodType:     1,
+      });
+      const foodId = parseFoodIdFromResponse(raw);
+      return { success: true, foodId, message: `Recipe "${args.name}" created with food ID ${foodId}.` };
+    }
+
+    case 'update_recipe': {
+      const nutrients = await resolveNutrients(userId, token, args.ingredients, args.nutrients);
+      const raw = await gwtEditFood(token, parseInt(userId), args.foodId, args.primaryMeasureId, {
+        name:         args.name,
+        servingName:  args.servingName || 'full recipe',
+        servingGrams: args.servingGrams,
+        ingredients:  args.ingredients,
+        nutrients,
+        note:         args.note || '',
+      });
+      const foodId = parseFoodIdFromResponse(raw);
+      return { success: true, foodId, message: `Recipe "${args.name}" updated (food ID ${foodId}).` };
+    }
+
+    case 'get_gwt_permutation': {
+      const hash = await getPermutationHash();
+      return { permutation_hash: hash, header_name: 'X-GWT-Permutation', source: 'cronometer.nocache.js' };
+    }
 
     default:
       throw new Error(`Unknown tool: ${name}`);
