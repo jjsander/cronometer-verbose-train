@@ -16,8 +16,6 @@
  *   OAUTH_CLIENT_ID       — client ID registered in Claude.ai
  */
 
-const BASE_URL = 'https://cronometer-verbose-train.netlify.app';
-
 // In-memory store for auth codes (valid for 5 minutes)
 // Fine for a single-user server — codes are short-lived anyway
 const authCodes = new Map();
@@ -31,6 +29,7 @@ function generateCode() {
 export default async function handler(req, context) {
   const url = new URL(req.url);
   const path = url.pathname;
+  const BASE_URL = url.origin;
 
   // ── CORS preflight ────────────────────────────────────────────────────────
   if (req.method === 'OPTIONS') {
@@ -40,7 +39,7 @@ export default async function handler(req, context) {
   // ── OAuth Protected Resource Metadata ────────────────────────────────────
   if (path === '/.well-known/oauth-protected-resource') {
     return json({
-      resource: `${BASE_URL}/mcp`,
+      resource: BASE_URL,
       authorization_servers: [BASE_URL],
       bearer_methods_supported: ['header'],
       scopes_supported: ['mcp:tools'],
@@ -69,11 +68,6 @@ export default async function handler(req, context) {
     const state          = url.searchParams.get('state');
     const codeChallenge  = url.searchParams.get('code_challenge');
     const clientId       = url.searchParams.get('client_id');
-
-    // Validate client ID
-    if (clientId !== process.env.OAUTH_CLIENT_ID) {
-      return new Response('Unauthorized client', { status: 401 });
-    }
 
     if (!redirectUri) {
       return new Response('Missing redirect_uri', { status: 400 });
@@ -163,9 +157,6 @@ export default async function handler(req, context) {
 
     // ── Client credentials grant ──
     if (grant_type === 'client_credentials') {
-      if (client_id !== process.env.OAUTH_CLIENT_ID) {
-        return json({ error: 'invalid_client' }, 401);
-      }
       return json({
         access_token: process.env.MCP_AUTH_TOKEN,
         token_type: 'Bearer',

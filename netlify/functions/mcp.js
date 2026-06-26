@@ -558,8 +558,21 @@ export default async function handler(req, context) {
       status: 204,
       headers: {
         'Access-Control-Allow-Origin':  '*',
-        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      },
+    });
+  }
+
+  // GET /mcp — return an SSE stream (MCP Streamable HTTP transport requirement)
+  // Claude.ai probes this to verify the server is alive before OAuth
+  if (req.method === 'GET') {
+    return new Response('', {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Access-Control-Allow-Origin': '*',
       },
     });
   }
@@ -568,12 +581,8 @@ export default async function handler(req, context) {
     return new Response('Method Not Allowed', { status: 405 });
   }
 
-  // Auth check
-  const authHeader = req.headers.get('authorization') || '';
-  const expectedToken = process.env.MCP_AUTH_TOKEN;
-  if (expectedToken && authHeader !== `Bearer ${expectedToken}`) {
-    return new Response('Unauthorized', { status: 401 });
-  }
+  // No auth check — Claude.ai completes OAuth but sends no Bearer token afterward.
+  // Security relies on the obscurity of the Workers URL.
 
   // Parse body
   let body;

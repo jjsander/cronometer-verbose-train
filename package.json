@@ -4,12 +4,19 @@
   "description": "Cronometer MCP server for Claude.ai — Netlify Functions",
   "type": "module",
   "scripts": {
-    "dev": "netlify dev"
+    "dev": "netlify dev",
+    "worker:dev": "wrangler dev --port 8787"
   },
   "dependencies": {
     "node-fetch": "^3.3.2"
   },
   "devDependencies": {
-    "netlify-cli": "^26.1.0"
+    "netlify-cli": "^26.1.0",
+    "wrangler": "^3.0.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.0": true,
+    "esbuild@0.17.19": true,
+    "workerd@1.20250718.0": true
   }
 }
