@@ -358,7 +358,12 @@ export function buildFoodPayload({
   tok.push(0, 0);                 // placeholders (id=0 for new; server fills on create)
   tok.push(AL, 0, 0);             // empty ArrayList (unused substitution list?)
   tok.push(IDX.note);             // note string
-  tok.push(0, 0, 0);             // null/zero placeholders for other Food fields
+  // addFood: 3 zero placeholders. editFood: 2 zeros + foodId (HAR-confirmed field ordering).
+  if (isCreate) {
+    tok.push(0, 0, 0);
+  } else {
+    tok.push(0, 0, foodId);
+  }
 
   // Ingredient list
   tok.push(AL, ingredients.length);
@@ -373,22 +378,37 @@ export function buildFoodPayload({
   // FoodMeasures container
   tok.push(IDX.foodMeas, primaryMeasureId);
 
-  // Measures ArrayList: named serving + "Serving" + "g"
+  // Measures ArrayList (3 measures). Order and back-ref value differ by method:
+  //   addFood:  servingName first (T_MEAS_TYPE inline, grams=1), then Serving, then g (servingGrams). back-ref=-10.
+  //   editFood: g first (T_MEAS_TYPE inline, grams=servingGrams), then servingName, then Serving. back-ref=-11.
+  //   editFood measures carry real measureIds: primary (servingName), primary+1 (Serving), primary+2 (g).
   tok.push(AL, 3);
 
-  // Measure 1: named serving (e.g. "full recipe"), type=3 (recipe), grams=1
-  tok.push(IDX.measure, 1, 0, foodId, 0, 0, IDX.servingName, IDX.measType, 3, 1);
-
-  // Measure 2: "Serving", grams=1, type backrefs to Measure$Type already seen
-  tok.push(IDX.measure, 1, 0, foodId, 0, 0, 18, -10, 1);
-
-  // Measure 3: "g", grams=servingGrams (basis weight per serving)
-  tok.push(IDX.measure, 1, 0, foodId, 0, 0, isCreate ? 19 : 15, -10, servingGrams);
+  if (isCreate) {
+    // Measure 1: named serving, type=3 (recipe), grams=1
+    tok.push(IDX.measure, 1, 0, foodId, 0, 0, IDX.servingName, IDX.measType, 3, 1);
+    // Measure 2: "Serving", grams=1
+    tok.push(IDX.measure, 1, 0, foodId, 0, 0, 18, -10, 1);
+    // Measure 3: "g", grams=servingGrams
+    tok.push(IDX.measure, 1, 0, foodId, 0, 0, 19, -10, servingGrams);
+  } else {
+    const gMeasureId      = primaryMeasureId + 2;
+    const servingMeasureId = primaryMeasureId + 1;
+    // Measure 1: "g" (introduces T_MEAS_TYPE), type=3, grams=servingGrams
+    tok.push(IDX.measure, 1, 0, foodId, gMeasureId, 0, 15, IDX.measType, 3, servingGrams);
+    // Measure 2: named serving, grams=1
+    tok.push(IDX.measure, 1, 0, foodId, primaryMeasureId, 0, IDX.servingName, -11, 1);
+    // Measure 3: "Serving", grams=1
+    tok.push(IDX.measure, 1, 0, foodId, servingMeasureId, 0, 18, -11, 1);
+  }
 
   // NutrientMap
   tok.push(IDX.nutriMap, IDX.nutriFilter, 0);
 
-  // Nutrient entries: [integer_type]|{id}|[nutrient_type]|{value}|{id}|-backref|
+  // Nutrient entries. Back-ref to Nutrient$Type differs by method (confirmed via HAR):
+  //   addFood: first entry writes T_NUTR_TYPE + 0, subsequent use -18.
+  //   editFood: same structure but back-ref is -19 (one extra object in editFood's graph).
+  const nutriBackRef = isCreate ? -18 : -19;
   const nutrientEntries = Object.entries(nutrients);
   tok.push(IDX.hashmap, nutrientEntries.length);
   let firstNutrient = true;
@@ -399,7 +419,7 @@ export function buildFoodPayload({
       tok.push(IDX.nutriType, 0);  // Nutrient$Type first occurrence + null enum value
       firstNutrient = false;
     } else {
-      tok.push(-18);  // back-reference to Nutrient$Type (fixed type-slot offset, confirmed via HAR)
+      tok.push(nutriBackRef);
     }
   }
 
