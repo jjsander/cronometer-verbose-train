@@ -396,10 +396,10 @@ export function buildFoodPayload({
     const id = Number(idStr);
     tok.push(IDX.integer, id, IDX.nutrient, value, id);
     if (firstNutrient) {
-      tok.push(0);               // Nutrient$Type first occurrence = null/0
+      tok.push(IDX.nutriType, 0);  // Nutrient$Type first occurrence + null enum value
       firstNutrient = false;
     } else {
-      tok.push(-(ingredients.length + 18)); // back-reference to reuse Nutrient$Type
+      tok.push(-18);  // back-reference to Nutrient$Type (fixed type-slot offset, confirmed via HAR)
     }
   }
 
