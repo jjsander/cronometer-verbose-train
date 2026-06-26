@@ -71,17 +71,17 @@ export function invalidatePermutationCache() {
  * Throws on HTTP error or //EX server exception.
  * On 403, invalidates the permutation cache automatically.
  */
-async function gwtPost(payload, methodHint = '') {
+async function gwtPost(payload, methodHint = '', sessionToken = '') {
   const permHash = await getPermutationHash();
-  const res = await fetch(GWT_RPC_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'text/x-gwt-rpc; charset=UTF-8',
-      'X-GWT-Permutation': permHash,
-      'X-GWT-Module-Base': MODULE_BASE,
-    },
-    body: payload,
-  });
+  const headers = {
+    'Content-Type': 'text/x-gwt-rpc; charset=UTF-8',
+    'X-GWT-Permutation': permHash,
+    'X-GWT-Module-Base': MODULE_BASE,
+    'User-Agent': 'cronometer-mcp/1.0',
+    'Referer': 'https://cronometer.com/',
+  };
+  if (sessionToken) headers['Cookie'] = `sesnonce=${sessionToken}`;
+  const res = await fetch(GWT_RPC_URL, { method: 'POST', headers, body: payload });
 
   if (res.status === 403) {
     invalidatePermutationCache();
@@ -432,7 +432,7 @@ export function buildFoodPayload({
  */
 export async function addFood(session, userId, food) {
   const payload = buildFoodPayload({ method: 'addFood', session, userId, foodId: 0, primaryMeasureId: 0, ...food });
-  return gwtPost(payload, 'addFood');
+  return gwtPost(payload, 'addFood', session);
 }
 
 /**
@@ -447,7 +447,7 @@ export async function addFood(session, userId, food) {
  */
 export async function editFood(session, userId, foodId, primaryMeasureId, food) {
   const payload = buildFoodPayload({ method: 'editFood', session, userId, foodId, primaryMeasureId, ...food });
-  return gwtPost(payload, 'editFood');
+  return gwtPost(payload, 'editFood', session);
 }
 
 /**
