@@ -358,7 +358,7 @@ export function buildFoodPayload({
   tok.push(0, 0);                 // placeholders (id=0 for new; server fills on create)
   tok.push(AL, 0, 0);             // empty ArrayList (unused substitution list?)
   tok.push(IDX.note);             // note string
-  tok.push(0, 0, 0, 0);          // null/zero placeholders for other Food fields
+  tok.push(0, 0, 0);             // null/zero placeholders for other Food fields
 
   // Ingredient list
   tok.push(AL, ingredients.length);
