@@ -472,12 +472,20 @@ export async function editFood(session, userId, foodId, primaryMeasureId, food) 
 
 /**
  * Parse the foodId from a GWT //OK addFood/editFood response.
- * First numeric value in the response is the food ID.
+ *
+ * The response is a reversed GWT-RPC token stream. The foodId appears as
+ * the Food object's id field just before its other zero-padded fields and
+ * the string table: `{foodId},0,0,3,0,0,2,0,0,1,[strings...]`
+ *
+ * The first token (//OK[N,...) is the userId, not the foodId.
  */
 export function parseFoodIdFromResponse(responseText) {
-  const match = responseText.match(/^\/\/OK\[(\d+),/);
-  if (!match) throw new Error(`Unexpected GWT response: ${responseText.slice(0, 100)}`);
-  return Number(match[1]);
+  const match = responseText.match(/,(\d{6,}),0,0,3,0,0,2,0,0,1,\[/);
+  if (match) return Number(match[1]);
+  // Fallback: first large number that isn't the userId (position 1)
+  const nums = responseText.match(/\d{6,}/g);
+  if (nums && nums.length >= 2) return Number(nums[1]);
+  throw new Error(`Could not parse foodId from GWT response: ${responseText.slice(0, 100)}`);
 }
 
 export { GWT_TYPE_SIG };
