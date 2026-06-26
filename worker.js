@@ -10,11 +10,9 @@
  */
 
 import mcpHandler from './netlify/functions/mcp.js';
-import oauthHandler from './netlify/functions/oauth.js';
 
 export default {
   async fetch(request, env, ctx) {
-    // Polyfill process.env so existing function code works unchanged
     globalThis.process = { env };
 
     const url = new URL(request.url);
@@ -24,13 +22,16 @@ export default {
       return mcpHandler(request, {});
     }
 
-    if (
-      path === '/.well-known/oauth-protected-resource' ||
-      path === '/.well-known/oauth-authorization-server' ||
-      path === '/authorize' ||
-      path === '/oauth/token'
-    ) {
-      return oauthHandler(request, {});
+    if (path === '/.well-known/oauth-protected-resource') {
+      return new Response(JSON.stringify({
+        resource: url.origin,
+        authorization_servers: [],
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
     }
 
     return new Response('Not Found', { status: 404 });
